@@ -5,11 +5,14 @@ Grouped by categories: Gazebo, Vision, ArduPilot, and ROS2
 """
 
 import sys
+import os
 import subprocess
 import threading
 import warnings
 import time
+import signal
 from threading import Lock
+from queue import Queue
 
 # Suppress PyQt5 deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -18,7 +21,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QTabWidget, QTextEdit, QLabel, QComboBox, QStyleFactory,
     QSplitter
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QIcon
 
 # Mapping commands from bashrc
@@ -28,7 +31,6 @@ COMMANDS = {
         "Final World": "gz sim -v 3 -r sauvc_final.world",
     },
     "Vision": {
-        "Front Camera Bridge": "ros2 run ros_gz_bridge parameter_bridge '/front_camera@sensor_msgs/msg/Image@gz.msgs.Image'",
         "Docker Container": "docker start -ai be537dc7c441",
     },
     "RQT": {
@@ -41,6 +43,7 @@ COMMANDS = {
         "Launch MAVRoS": "ros2 launch mavros apm.launch fcu_url:=udp://:14550@localhost:14555",
     },
     "ROS2": {
+        "Front Camera Bridge": "ros2 run ros_gz_bridge parameter_bridge '/front_camera@sensor_msgs/msg/Image@gz.msgs.Image'",
         "Build Package": "cd ~/ros2_ws && colcon build --packages-select sauvc26_code",
         "Arm": "ros2 run sauvc26_code arm",
         "Qualification": "ros2 run sauvc26_code qualification",
@@ -52,38 +55,26 @@ COMMANDS = {
 }
 
 
-class CommandExecutor(QObject):
-    """Worker thread to run commands without freezing GUI"""
-    output_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
+class CommandExecutor:
+    """Worker to run commands without freezing GUI"""
 
-    def __init__(self, output_widget=None, ui_lock=None):
-        super().__init__()
+    def __init__(self, output_queue=None):
         self.process = None
-        self.output_widget = output_widget  # Direct widget reference
-        self.ui_lock = ui_lock  # Thread lock for UI safety
+        self.output_queue = output_queue  # Queue for posting output
 
-    def append_to_widget(self, text):
-        """Safely append text to output widget"""
-        print(f"DEBUG append_to_widget called: output_widget={self.output_widget is not None}, ui_lock={self.ui_lock is not None}")
-        if self.output_widget and self.ui_lock:
-            print(f"DEBUG: Attempting to append...")
-            with self.ui_lock:
-                self.output_widget.append(text.rstrip('\n'))
-                print(f"DEBUG append_to_widget: appended {len(text)} chars")
-        else:
-            print(f"DEBUG: output_widget or ui_lock is None!")
+    def append_to_queue(self, text):
+        """Post text to output queue"""
+        if self.output_queue:
+            self.output_queue.put(text.rstrip('\n'))
 
     def run_command(self, command):
-        """Run command and emit output"""
-        print(f"DEBUG: run_command called with: {command}")
+        """Run command and post output to queue"""
         try:
             text = f"▶ Running: {command}\n"
-            print(f"DEBUG: Appending initial text")
-            self.append_to_widget(text)
-            self.append_to_widget("─" * 80)
+            self.append_to_queue(text)
+            self.append_to_queue("─" * 80)
 
-            # Run command using shell
+            # Run command using shell, with new process group for proper cleanup
             self.process = subprocess.Popen(
                 command,
                 shell=True,
@@ -93,52 +84,123 @@ class CommandExecutor(QObject):
                 bufsize=1,
                 universal_newlines=True
             )
-            print(f"DEBUG: Process started, PID: {self.process.pid}")
 
             # Read output in real-time
-            if self.process.stdout:
-                print(f"DEBUG: stdout is available")
-                line_count = 0
-                while True:
-                    line = self.process.stdout.readline()
-                    if not line:
-                        print(f"DEBUG: No more lines from stdout")
-                        break
-                    line_count += 1
-                    if line_count % 10 == 0:
-                        print(f"DEBUG: Read {line_count} lines so far")
-                    if line.strip():  # Only append non-empty lines
-                        print(f"DEBUG: Calling append_to_widget for line {line_count}")
-                        self.append_to_widget(line)
-                    else:
-                        print(f"DEBUG: Skipping empty line {line_count}")
-            else:
-                print(f"DEBUG: stdout is NOT available!")
+            try:
+                if self.process.stdout:
+                    while True:
+                        try:
+                            line = self.process.stdout.readline()
+                            if not line:
+                                break
+                            if line.strip():  # Only append non-empty lines
+                                self.append_to_queue(line)
+                        except ValueError:
+                            # This happens when stdout is closed (process killed)
+                            break
+            except Exception as e:
+                pass
 
             self.process.wait()
-            print(f"DEBUG: Process finished with return code: {self.process.returncode}")
-            self.append_to_widget("─" * 80)
-            self.append_to_widget(f"✓ Command finished (exit code: {self.process.returncode})\n")
+            self.append_to_queue("─" * 80)
+            self.append_to_queue(f"✓ Command finished (exit code: {self.process.returncode})\n")
 
         except Exception as e:
-            print(f"DEBUG: Exception occurred: {e}")
-            self.append_to_widget(f"✗ Error: {str(e)}\n")
-
-        finally:
-            print(f"DEBUG: Emitting finished signal")
-            self.finished_signal.emit()
+            self.append_to_queue(f"✗ Error: {str(e)}\n")
 
     def kill_process(self):
-        """Kill the running process"""
-        if self.process and self.process.poll() is None:
+        """Kill the running process like Ctrl+C in terminal"""
+        if not self.process:
+            print("[KILL] No process"); sys.stdout.flush()
+            return
+        
+        print(f"[KILL] START - PID={self.process.pid}"); sys.stdout.flush()
+        
+        if self.output_queue:
+            self.output_queue.put("\n✗ KILLING PROCESS (Ctrl+C)...")
+        
+        try:
+            pid = self.process.pid
+            print(f"[KILL] Got PID={pid}"); sys.stdout.flush()
+            
+            # Try to kill the PROCESS GROUP (not just the shell)
+            # This is the key - when shell=True, we need to kill the group
+            print(f"[KILL] Trying to get process group..."); sys.stdout.flush()
             try:
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except:
-                try:
-                    self.process.kill()
-                except:
-                    pass
+                pgid = os.getpgid(pid)
+                print(f"[KILL] Got PGID={pgid}"); sys.stdout.flush()
+                
+                # SIGINT to the process group (like Ctrl+C)
+                print(f"[KILL] Sending SIGINT to group {pgid}"); sys.stdout.flush()
+                os.killpg(pgid, signal.SIGINT)
+                print(f"[KILL] SIGINT sent!"); sys.stdout.flush()
+                
+                if self.output_queue:
+                    self.output_queue.put(f"[1] Sent SIGINT to process group {pgid}")
+                
+                time.sleep(0.5)
+                
+                if self.process.poll() is not None:
+                    print(f"[KILL] Process dead after SIGINT"); sys.stdout.flush()
+                    if self.output_queue:
+                        self.output_queue.put(f"✓ Process exited (code: {self.process.returncode})")
+                    return
+                    
+                # Try SIGTERM
+                print(f"[KILL] Sending SIGTERM to group..."); sys.stdout.flush()
+                os.killpg(pgid, signal.SIGTERM)
+                print(f"[KILL] SIGTERM sent!"); sys.stdout.flush()
+                
+                if self.output_queue:
+                    self.output_queue.put(f"[2] Sent SIGTERM")
+                
+                time.sleep(0.5)
+                
+                if self.process.poll() is not None:
+                    print(f"[KILL] Process dead after SIGTERM"); sys.stdout.flush()
+                    if self.output_queue:
+                        self.output_queue.put(f"✓ Process terminated (code: {self.process.returncode})")
+                    return
+                
+                # Try SIGKILL
+                print(f"[KILL] Sending SIGKILL to group..."); sys.stdout.flush()
+                os.killpg(pgid, signal.SIGKILL)
+                print(f"[KILL] SIGKILL sent!"); sys.stdout.flush()
+                
+                if self.output_queue:
+                    self.output_queue.put(f"[3] Sent SIGKILL")
+                
+                time.sleep(0.2)
+                
+                final_code = self.process.poll()
+                print(f"[KILL] Final poll: {final_code}"); sys.stdout.flush()
+                
+                if final_code is not None:
+                    if self.output_queue:
+                        self.output_queue.put(f"✓ Process killed (code: {final_code})")
+                else:
+                    if self.output_queue:
+                        self.output_queue.put("ERROR: Process still alive after SIGKILL!")
+                        
+            except OSError as e:
+                print(f"[KILL] OSError getting PGID: {e}"); sys.stdout.flush()
+                # Fallback: try direct kill on PID
+                if self.output_queue:
+                    self.output_queue.put(f"Fallback: trying direct kill on PID {pid}")
+                os.kill(pid, signal.SIGINT)
+                time.sleep(0.3)
+                if self.process.poll() is None:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.3)
+                if self.process.poll() is None:
+                    os.kill(pid, signal.SIGKILL)
+                    
+        except Exception as e:
+            print(f"[KILL] Exception: {e}"); sys.stdout.flush()
+            if self.output_queue:
+                self.output_queue.put(f"Kill error: {str(e)}")
+        
+        print(f"[KILL] DONE"); sys.stdout.flush()
 
 
 class ROS2CommandGUI(QMainWindow):
@@ -147,11 +209,16 @@ class ROS2CommandGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.output_widgets = {}  # Store output text widgets for each category
+        self.output_queues = {}   # Store output queues for each category
         self.worker_threads = {}  # Store worker threads for each category
         self.executors = {}  # Store executors for each category
         self.command_output_map = {}  # Map command name to its output widget key
-        self.ui_lock = Lock()  # Thread lock for UI safety
         self.init_ui()
+        
+        # Start a timer to process output queues
+        self.queue_timer = QTimer()
+        self.queue_timer.timeout.connect(self.process_output_queues)
+        self.queue_timer.start(100)  # Process every 100ms
 
     def init_ui(self):
         """Initialize UI"""
@@ -172,6 +239,19 @@ class ROS2CommandGUI(QMainWindow):
         self.tab_widget = QTabWidget()
         self.create_tabs()
         layout.addWidget(self.tab_widget, 1)
+
+    def process_output_queues(self):
+        """Process output from all queues and update widgets"""
+        for output_key, output_queue in self.output_queues.items():
+            if output_queue and output_key in self.output_widgets:
+                output_widget = self.output_widgets[output_key]
+                try:
+                    while True:
+                        text = output_queue.get_nowait()
+                        output_widget.append(text)
+                except:
+                    # Queue is empty
+                    pass
 
     def create_tabs(self):
         """Create tabs for each category with separate output terminals"""
@@ -238,8 +318,9 @@ class ROS2CommandGUI(QMainWindow):
                     output_text.setFont(QFont("Courier", 9))
                     output_layout.addWidget(output_text)
 
-                    # Store output widget for this category
+                    # Store output widget and queue for this category
                     self.output_widgets[category] = output_text
+                    self.output_queues[category] = Queue()
 
                     # Button layout for clear and kill
                     button_layout = QHBoxLayout()
@@ -320,8 +401,9 @@ class ROS2CommandGUI(QMainWindow):
         sitl_clear_btn.clicked.connect(sitl_text.clear)
         sitl_layout.addWidget(sitl_clear_btn)
 
-        # Store SITL output widget
+        # Store SITL output widget and queue
         self.output_widgets["ArduPilot_SITL"] = sitl_text
+        self.output_queues["ArduPilot_SITL"] = Queue()
         
         # Assign SITL commands to SITL output
         self.command_output_map["Start SITL"] = "ArduPilot_SITL"
@@ -341,11 +423,9 @@ class ROS2CommandGUI(QMainWindow):
         mavros_clear_btn.clicked.connect(mavros_text.clear)
         mavros_layout.addWidget(mavros_clear_btn)
 
-        # Store MAVRoS output widget
+        # Store MAVRoS output widget and queue
         self.output_widgets["ArduPilot_MAVRoS"] = mavros_text
-        
-        # Assign MAVRoS commands to MAVRoS output
-        self.command_output_map["Launch MAVRoS"] = "ArduPilot_MAVRoS"
+        self.output_queues["ArduPilot_MAVRoS"] = Queue()
 
         # Add both terminals to right layout vertically
         sitl_widget = QWidget()
@@ -366,36 +446,34 @@ class ROS2CommandGUI(QMainWindow):
     def run_command(self, category, command, name):
         """Run command in separate thread for specific category"""
         
-        # Determine output widget for this command
+        # Determine output queue for this command
         if name in self.command_output_map:
             output_key = self.command_output_map[name]
-            output_widget = self.output_widgets.get(output_key)
-        elif category in self.output_widgets:
+            output_queue = self.output_queues.get(output_key)
+        elif category in self.output_queues:
             output_key = category
-            output_widget = self.output_widgets.get(output_key)
+            output_queue = self.output_queues.get(output_key)
         else:
             # For RQT and other no-output categories
-            output_widget = None
+            output_queue = None
             output_key = None
         
-        if output_widget:
-            # Has output terminal
-            with self.ui_lock:
-                output_widget.append(f"\n{'='*80}")
-                output_widget.append(f"Command: {name}")
-                output_widget.append(f"{'='*80}")
+        if output_queue:
+            # Has output terminal - post separator to queue
+            output_queue.put(f"\n{'='*80}")
+            output_queue.put(f"Command: {name}")
+            output_queue.put(f"{'='*80}")
 
             # Create unique key for tracking this execution
             exec_key = f"{category}_{name}" if category == "ArduPilot" else category
 
             # Stop previous worker thread if still running
-            if exec_key in self.worker_threads and self.worker_threads[exec_key] and self.worker_threads[exec_key].isAlive():
-                with self.ui_lock:
-                    output_widget.append("⚠ Previous command is still running...")
+            if exec_key in self.worker_threads and self.worker_threads[exec_key] and self.worker_threads[exec_key].is_alive():
+                output_queue.put("⚠ Previous command is still running...")
                 return
 
-            # Create executor and thread - PASS OUTPUT WIDGET DIRECTLY!
-            executor = CommandExecutor(output_widget=output_widget, ui_lock=self.ui_lock)
+            # Create executor and thread - PASS OUTPUT QUEUE!
+            executor = CommandExecutor(output_queue=output_queue)
             worker_thread = threading.Thread(target=executor.run_command, args=(command,))
             worker_thread.daemon = True
 
@@ -407,8 +485,7 @@ class ROS2CommandGUI(QMainWindow):
             worker_thread.start()
         else:
             # No output - just run in background (like RQT)
-            print(f"DEBUG: Running {name} without output")
-            executor = CommandExecutor(output_widget=None, ui_lock=self.ui_lock)
+            executor = CommandExecutor(output_queue=None)
             worker_thread = threading.Thread(target=executor.run_command, args=(command,))
             worker_thread.daemon = True
             self.executors[category] = executor
@@ -417,33 +494,39 @@ class ROS2CommandGUI(QMainWindow):
 
     def kill_terminal(self, category):
         """Kill the running command in a category"""
+        killed_any = False
+        
         if category == "ArduPilot":
-            # Kill both SITL and MAVRoS if running
+            # Kill both SITL and MAVRoS if running (in background thread)
             for exec_key in ["ArduPilot_Start SITL", "ArduPilot_Launch MAVRoS"]:
                 if exec_key in self.executors and self.executors[exec_key]:
-                    self.executors[exec_key].kill_process()
-            # Notify both terminals
-            if "ArduPilot_SITL" in self.output_widgets:
-                with self.ui_lock:
-                    self.output_widgets["ArduPilot_SITL"].append("✗ Terminal killed by user")
-            if "ArduPilot_MAVRoS" in self.output_widgets:
-                with self.ui_lock:
-                    self.output_widgets["ArduPilot_MAVRoS"].append("✗ Terminal killed by user")
+                    executor = self.executors[exec_key]
+                    if executor.process and executor.process.poll() is None:
+                        # Run kill in background thread to avoid blocking GUI
+                        threading.Thread(target=executor.kill_process, daemon=True).start()
+                        killed_any = True
+            
+            # Notify both terminals via queue
+            if "ArduPilot_SITL" in self.output_queues:
+                self.output_queues["ArduPilot_SITL"].put("✗ Terminal killed by user")
+            if "ArduPilot_MAVRoS" in self.output_queues:
+                self.output_queues["ArduPilot_MAVRoS"].put("✗ Terminal killed by user")
         else:
-            if category in self.executors and self.executors[category]:
-                self.executors[category].kill_process()
-                if category in self.output_widgets:
-                    with self.ui_lock:
-                        self.output_widgets[category].append("✗ Terminal killed by user")
-
-    def append_output(self, output_key, text):
-        """Deprecated - output now directly appends from CommandExecutor"""
-        pass
-
-    def command_finished(self, category):
-        """Called when command finishes for a specific category"""
-        pass
-
+            # For non-ArduPilot categories, find any running executor for this category
+            for exec_key in list(self.executors.keys()):
+                if exec_key.startswith(category) or exec_key == category:
+                    executor = self.executors[exec_key]
+                    if executor and executor.process and executor.process.poll() is None:
+                        # Run kill in background thread to avoid blocking GUI
+                        threading.Thread(target=executor.kill_process, daemon=True).start()
+                        killed_any = True
+            
+            # Notify output terminal
+            if category in self.output_queues:
+                if killed_any:
+                    self.output_queues[category].put("✗ Terminal killed by user")
+                else:
+                    self.output_queues[category].put("ℹ No running process to kill")
 
 def main():
     app = QApplication(sys.argv)
