@@ -7,6 +7,10 @@ Grouped by categories: Gazebo, Vision, ArduPilot, and ROS2
 import sys
 import subprocess
 import threading
+import warnings
+
+# Suppress PyQt5 deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTabWidget, QTextEdit, QLabel, QComboBox, QStyleFactory
