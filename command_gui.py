@@ -12,6 +12,7 @@ import warnings
 import time
 import signal
 import re
+import select
 import psutil
 from threading import Lock
 from queue import Queue
@@ -74,13 +75,7 @@ COMMANDS = {
     }
 }
 
-# Jetson Orin Nano Power Modes
-POWER_MODES = {
-    "1": "sudo nvpmodel -m 3",  # 7W
-    "2": "sudo nvpmodel -m 0",  # 15W
-    "3": "sudo nvpmodel -m 1",  # 25W
-    "Max": "sudo nvpmodel -m 2",  # MAXN SUPER
-}
+
 
 
 class CommandExecutor:
@@ -270,7 +265,7 @@ class ConsoleWidget(QFrame):
 
 
 class MonitoringPanel(QFrame):
-    """System monitoring panel (placeholder)"""
+    """System monitoring panel using tegrastats"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -284,27 +279,88 @@ class MonitoringPanel(QFrame):
 
         # Monitoring items
         self.stats = {
+            "RAM": QLabel("RAM: --"),
             "CPU": QLabel("CPU: --"),
             "GPU": QLabel("GPU: --"),
-            "Memory": QLabel("Memory: --"),
-            "Temp": QLabel("Temp: --"),
-            "Watt": QLabel("Watt: --"),
+            "PWR": QLabel("PWR: --"),
+            "TMP": QLabel("TMP: --"),
         }
 
         for key, label in self.stats.items():
-            label.setFont(QFont("Ubuntu Mono", 9))
+            label.setFont(QFont("Ubuntu Mono", 8))
             layout.addWidget(label)
 
         layout.addStretch()
+        
+        self.tegrastats_process = None
+        self.start_tegrastats()
+
+    def start_tegrastats(self):
+        """Start tegrastats process to read monitoring data"""
+        try:
+            self.tegrastats_process = subprocess.Popen(
+                ["tegrastats", "--interval", "2000"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+        except Exception as e:
+            print(f"Error starting tegrastats: {e}")
 
     def update_stats(self):
-        """Update monitoring stats"""
+        """Update monitoring stats from tegrastats output"""
         try:
-            cpu = psutil.cpu_percent(interval=0.1)
-            mem = psutil.virtual_memory()
-            self.stats["CPU"].setText(f"CPU: {cpu}%")
-            self.stats["Memory"].setText(f"Memory: {mem.percent}%")
-        except Exception:
+            if self.tegrastats_process and self.tegrastats_process.stdout:
+                import select
+                # Non-blocking read
+                ready, _, _ = select.select([self.tegrastats_process.stdout], [], [], 0)
+                if ready:
+                    line = self.tegrastats_process.stdout.readline()
+                    if line:
+                        self._parse_tegrastats_line(line)
+        except Exception as e:
+            pass
+
+    def _parse_tegrastats_line(self, line):
+        """Parse tegrastats output line"""
+        try:
+            # RAM parsing: RAM 2234/7772MB
+            ram_match = re.search(r'RAM (\d+)/(\d+)MB', line)
+            if ram_match:
+                ram_used = ram_match.group(1)
+                ram_total = ram_match.group(2)
+                self.stats["RAM"].setText(f"RAM: {ram_used}/{ram_total}MB")
+            
+            # CPU parsing: CPU [xx%,yy%,zz%,ww%]
+            cpu_match = re.search(r'CPU \[([^\]]+)\]', line)
+            if cpu_match:
+                cpu_vals = cpu_match.group(1).split(',')
+                try:
+                    cpu_avg = sum(int(v.strip().replace('%', '')) for v in cpu_vals) // len(cpu_vals)
+                    self.stats["CPU"].setText(f"CPU: {cpu_avg}%")
+                except:
+                    pass
+            
+            # GPU parsing: GR3D_FREQ xx%
+            gpu_match = re.search(r'GR3D_FREQ (\d+)%', line)
+            if gpu_match:
+                gpu = gpu_match.group(1)
+                self.stats["GPU"].setText(f"GPU: {gpu}%")
+            
+            # Power parsing: VDD_IN xxxmW
+            pwr_match = re.search(r'VDD_IN (\d+)mW', line)
+            if pwr_match:
+                pwr = pwr_match.group(1)
+                self.stats["PWR"].setText(f"PWR: {pwr}mW")
+            
+            # Temperature parsing: CV @xx.xC
+            temps = re.findall(r'@([0-9.]+)C', line)
+            if temps:
+                temp_vals = [float(t) for t in temps]
+                avg_temp = sum(temp_vals) / len(temp_vals)
+                self.stats["TMP"].setText(f"TMP: {avg_temp:.1f}°C")
+        except Exception as e:
             pass
 
 
@@ -443,7 +499,7 @@ class CompactCommandGUI(QMainWindow):
 
     def init_ui(self):
         """Initialize UI"""
-        self.setWindowTitle("GUI Amarine v2.0")
+        self.setWindowTitle("GUI Amarine v2.1")
         self.setGeometry(100, 100, 560, 1000)
         QApplication.setStyle(QStyleFactory.create('Fusion'))
 
@@ -488,88 +544,43 @@ class CompactCommandGUI(QMainWindow):
 
         col1_layout.addWidget(gazebo_frame)
 
-        # 8 Template buttons (4x2)
+        # Template buttons: Camera Bridge and Open RQT
         template_grid = QGridLayout()
         template_grid.setSpacing(5)
         self.template_buttons = {}
 
-        for row in range(4):
-            for col in range(2):
-                idx = row * 2 + col
-                btn = QPushButton("Camera Bridge" if idx == 0 else "")
-                btn.setMinimumHeight(40)
-                btn.setFont(QFont("Ubuntu", 9))
-                
-                if idx == 0:  # Camera Bridge
-                    btn.clicked.connect(lambda checked, b=btn: self._toggle_template_button(b, 0))
-                else:  # Template
-                    btn.clicked.connect(lambda checked, b=btn: self._toggle_template_button(b, idx))
-                
-                self.template_buttons[idx] = {'button': btn, 'is_running': False, 'executor': None}
-                template_grid.addWidget(btn, row, col)
+        # Camera Bridge button
+        btn_camera = QPushButton("Camera Bridge")
+        btn_camera.setMinimumHeight(40)
+        btn_camera.setFont(QFont("Ubuntu", 9))
+        btn_camera.clicked.connect(lambda checked, b=btn_camera: self._toggle_template_button(b, 0))
+        self.template_buttons[0] = {'button': btn_camera, 'is_running': False, 'executor': None}
+        template_grid.addWidget(btn_camera, 0, 0)
+        
+        # Open RQT button
+        btn_rqt = QPushButton("Open RQT")
+        btn_rqt.setMinimumHeight(40)
+        btn_rqt.setFont(QFont("Ubuntu", 9))
+        btn_rqt.clicked.connect(lambda checked: self._open_rqt())
+        self.template_buttons[1] = {'button': btn_rqt, 'is_running': False}
+        template_grid.addWidget(btn_rqt, 0, 1)
 
         col1_layout.addLayout(template_grid)
         top_layout.addWidget(col1_frame, 1)
         col1_frame.setMinimumWidth(150)
 
-        # ===== COLUMN 2: TEMPLATE BUTTONS, POWER MODE =====
+        # ===== COLUMN 2: KILL ALL BUTTON =====
         col2_frame = QFrame()
         col2_layout = QVBoxLayout(col2_frame)
         col2_layout.setSpacing(5)
+        col2_layout.addStretch()
 
-        # 6 Template buttons (3x2)
-        template_grid2 = QGridLayout()
-        template_grid2.setSpacing(5)
-        
-        button_labels = ["Open RQT", "Open RVIZ", "Open Qground", "Open Vscode", "Open Terminal", "Open BLHeli"]
-
-        for row in range(3):
-            for col in range(2):
-                idx = row * 2 + col
-                btn = QPushButton(button_labels[idx])
-                btn.setMinimumHeight(40)
-                btn.setFont(QFont("Ubuntu", 9))
-                btn.clicked.connect(lambda checked, b=btn, i=idx: self._on_utility_button_clicked(i))
-                self.template_buttons[100 + idx] = {'button': btn, 'is_running': False, 'executor': None}
-                template_grid2.addWidget(btn, row, col)
-
-        col2_layout.addLayout(template_grid2)
-
-        # Power Mode Option
-        power_frame = QFrame()
-        power_frame.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
-        power_layout = QVBoxLayout(power_frame)
-        power_label = QLabel("Power Mode Option")
-        power_label.setFont(QFont("Ubuntu", 9, QFont.Bold))
-        power_layout.addWidget(power_label)
-
-        power_grid = QGridLayout()
-        power_grid.setSpacing(5)
-        
-        for i, mode in enumerate(["1", "2", "3", "Max"]):
-            btn = QPushButton(mode)
-            btn.setMinimumHeight(30)
-            btn.setFont(QFont("Ubuntu", 9))
-            btn.clicked.connect(lambda checked, m=mode: self._set_power_mode(m))
-            power_grid.addWidget(btn, 0, i)
-
-        power_layout.addLayout(power_grid)
-        col2_layout.addWidget(power_frame)
-
-        # Settings and Kill All
-        settings_layout = QHBoxLayout()
-        settings_btn = QPushButton("Settings")
-        settings_btn.setMinimumHeight(30)
-        settings_btn.setFont(QFont("Ubuntu", 9))
-        settings_layout.addWidget(settings_btn)
-
+        # Kill All button
         kill_all_btn = QPushButton("Kill All")
-        kill_all_btn.setMinimumHeight(30)
-        kill_all_btn.setFont(QFont("Ubuntu", 9))
+        kill_all_btn.setMinimumHeight(50)
+        kill_all_btn.setFont(QFont("Ubuntu", 10, QFont.Bold))
         kill_all_btn.clicked.connect(self._kill_all_processes)
-        settings_layout.addWidget(kill_all_btn)
-
-        col2_layout.addLayout(settings_layout)
+        col2_layout.addWidget(kill_all_btn)
         col2_layout.addStretch()
 
         top_layout.addWidget(col2_frame, 1)
@@ -752,22 +763,11 @@ class CompactCommandGUI(QMainWindow):
                 thread.daemon = True
                 thread.start()
 
-    def _on_utility_button_clicked(self, button_idx):
-        """Handle utility button clicks to open applications"""
-        commands_map = {
-            0: "rqt",
-            1: "rviz2",
-            2: "qgroundcontrol",
-            3: "code ~/ros2_ws",
-            4: "terminator",
-            5: "BLHeliSuite32"
-        }
-        
-        if button_idx in commands_map:
-            command = commands_map[button_idx]
-            thread = threading.Thread(target=lambda: subprocess.Popen(command, shell=True))
-            thread.daemon = True
-            thread.start()
+    def _open_rqt(self):
+        """Open RQT application"""
+        thread = threading.Thread(target=lambda: subprocess.Popen("rqt", shell=True))
+        thread.daemon = True
+        thread.start()
 
     def _set_button_state(self, button, is_running, text):
         """Set button styling based on running state"""
@@ -864,15 +864,6 @@ class CompactCommandGUI(QMainWindow):
         """Run ROS2 package"""
         widget.run_command(command)
 
-    def _set_power_mode(self, mode):
-        """Set power mode on Jetson Orin Nano"""
-        if mode in POWER_MODES:
-            command = POWER_MODES[mode]
-            # Run with sudo in background
-            thread = threading.Thread(target=lambda: subprocess.call(f"echo 'Setting power mode {mode}' && {command}", shell=True))
-            thread.daemon = True
-            thread.start()
-
     def _kill_all_processes(self):
         """Kill all running processes"""
         for key, executor in self.executors.items():
@@ -895,14 +886,13 @@ class CompactCommandGUI(QMainWindow):
                 self._set_button_state(self.gazebo_btn, False, "Start")
                 self.executors['gazebo'].is_running = False
         
-        # Monitor template buttons
-        for idx, button_data in self.template_buttons.items():
-            if button_data['is_running'] and button_data['executor']:
+        # Monitor Camera Bridge button
+        if 0 in self.template_buttons:
+            button_data = self.template_buttons[0]
+            if button_data['is_running'] and button_data.get('executor'):
                 if button_data['executor'].process and button_data['executor'].process.poll() is not None:
                     button_data['is_running'] = False
-                    button = button_data['button']
-                    original_text = "Camera Bridge" if idx == 0 else ""
-                    self._set_button_state(button, False, original_text)
+                    self._set_button_state(button_data['button'], False, "Camera Bridge")
 
 
 if __name__ == "__main__":
